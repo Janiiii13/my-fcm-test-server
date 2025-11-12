@@ -1,4 +1,4 @@
-node_modules/ 
 .env 
 serviceAccountKey.json 
-.DS_Store 
+serviceAccountKey.b64 
+node_modules/ 
