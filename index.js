@@ -6,9 +6,12 @@ const path = require('path');
 const admin = require('firebase-admin');
 
 const app = express();
-app.use(express.json());
 
-// simple request logger
+// parse JSON and URL-encoded bodies
+app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // supports form posts
+
+// simple request logger (after parsers so body is available)
 app.use((req, res, next) => {
   console.log(new Date().toISOString(), req.method, req.url);
   next();
@@ -35,11 +38,27 @@ async function writeTokens(tokens) {
 app.get('/', (req, res) => res.send('Server running'));
 app.post('/', (req, res) => res.send('POST to / received — use /register to send tokens'));
 
-// register token (stores it to tokens.json)
+// register token (stores it to tokens.json) with improved logging & flexible field names
 app.post('/register', async (req, res) => {
-  const { token } = req.body;
+  // debug logging to help identify why token can be undefined
+  console.log('DEBUG req.headers:', req.headers);
+  console.log('DEBUG req.body:', req.body);
+
+  // accept token under several common property names or as query param
+  const token =
+    (req.body && (req.body.token || req.body.fcmToken || req.body.registrationToken || req.body.deviceToken))
+    || req.query.token;
+
   console.log('📱 Received FCM token:', token);
-  if (!token) return res.status(400).json({ error: 'missing token' });
+
+  if (!token) {
+    return res.status(400).json({
+      ok: false,
+      error: 'missing token in request. expected JSON like { "token": "..." }',
+      hint: 'Ensure Content-Type: application/json and JSON.stringify(body) on the client.',
+      receivedBody: req.body
+    });
+  }
 
   try {
     const tokens = await readTokens();
@@ -112,8 +131,10 @@ app.post('/send-all', async (req, res) => {
     if (!tokens.length) return res.status(400).json({ error: 'no tokens registered' });
 
     const messages = tokens.map(t => ({ token: t, notification: { title, body } }));
-    // Using sendAll or sendEach? For simplicity use Promise.all with send()
-    const results = await Promise.all(messages.map(m => admin.messaging().send(m).catch(err => ({ error: err.message || err }))));
+    // Using Promise.all with send() for simplicity — catch per-send errors so broadcast continues
+    const results = await Promise.all(
+      messages.map(m => admin.messaging().send(m).catch(err => ({ error: err.message || String(err) })))
+    );
 
     console.log('✅ Broadcast results:', results);
     res.json({ ok: true, results });
