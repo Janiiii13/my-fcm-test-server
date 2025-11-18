@@ -1,4 +1,4 @@
-// index.js - FIXED VERSION
+// index.js - COMPLETE FIXED VERSION
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -60,7 +60,7 @@ async function verifyPassword(candidatePassword, storedHashOrPlain) {
 }
 
 // =======================
-// 5. FCM TOKEN STORE - FIXED
+// 5. FCM TOKEN STORE
 // =======================
 // Store tokens by user: { uid: { token, role, timestamp } }
 const userTokens = new Map();
@@ -81,7 +81,7 @@ app.get('/', (req, res) => {
 });
 
 // =======================
-// 7. REGISTER FCM TOKEN - FIXED
+// 7. REGISTER FCM TOKEN
 // =======================
 app.post('/register', (req, res) => {
   const { uid, role, token } = req.body;
@@ -131,7 +131,7 @@ app.get('/tokens', (req, res) => {
 });
 
 // =======================
-// 9. SEND-CALL - IMPROVED
+// 9. SEND-CALL ROUTES
 // =======================
 app.get('/send-call', (req, res) => {
   res.json({
@@ -159,7 +159,7 @@ app.post('/send-call', async (req, res) => {
       symptoms,
       address,
       targetRole,  // optional - send to specific role (e.g., 'doctor')
-      useTopic     // NEW: set to true to use topic instead of tokens
+      useTopic     // optional - set to true to use topic instead of tokens
     } = req.body;
 
     if (!patientName || (!channelId && !channel && !roomId)) {
