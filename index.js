@@ -104,20 +104,36 @@ app.post('/register', (req, res) => {
 app.get('/send-call', (req, res) => {
   res.json({
     ok: true,
-    message: 'Use POST /send-call with { patientName, channelId } to send notification'
+    message: 'Use POST /send-call with { patientName, channelId } (and optional fields) to send notification'
   });
 });
 
 // Actual FCM sender
 app.post('/send-call', async (req, res) => {
   try {
-    const { patientName, channelId } = req.body;
     console.log('POST /send-call body:', req.body);
 
-    if (!patientName || !channelId) {
+    // basic required fields
+    const {
+      patientName,
+      channelId,      // old name you already used
+      // OPTIONAL (for better integration with main.dart→openVideoCallFromNotification)
+      roomId,
+      channel,
+      token,
+      agoraToken,
+      doctorUid,
+      submissionId,
+      age,
+      sex,
+      symptoms,
+      address
+    } = req.body;
+
+    if (!patientName || (!channelId && !channel && !roomId)) {
       return res.status(400).json({
         ok: false,
-        error: 'Missing patientName or channelId'
+        error: 'Missing patientName or channel/channelId/roomId'
       });
     }
 
@@ -131,28 +147,59 @@ app.post('/send-call', async (req, res) => {
 
     console.log('Sending call notification to tokens:', tokenList);
 
+    // Normalize fields to what Flutter main.dart expects:
+    // openVideoCallFromNotification reads:
+    //   roomId, channel, token, doctorUid, submissionId, patientName, age, sex, symptoms, address
+    const finalRoomId = (roomId || '').toString();
+    const finalChannel = (channel || channelId || '').toString();
+    const finalToken = (token || agoraToken || '').toString();
+    const finalDoctorUid = (doctorUid || '').toString();
+    const finalSubmissionId = (submissionId || '').toString();
+    const finalPatientName = (patientName || '').toString();
+    const finalAge = (age || '').toString();
+    const finalSex = (sex || '').toString();
+    const finalSymptoms = (symptoms || '').toString();
+    const finalAddress = (address || '').toString();
+
     const message = {
       tokens: tokenList,
 
       // Notification block = shows notif even when app is terminated
       notification: {
         title: 'Incoming TeleRHU Call',
-        body: `${patientName} is calling you`
+        body: finalPatientName
+          ? `${finalPatientName} is calling you`
+          : 'You have an incoming TeleRHU call',
+        // 👇 IMPORTANT for Flutter to route notification taps
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
       },
 
       android: {
         priority: 'high',
         notification: {
           sound: 'default',
-          channelId: 'telerhu_calls' // optional custom channel name
+          channelId: 'telerhu_calls' // your custom Android channel (match in native if you configure)
         }
       },
 
-      // Data payload Flutter can read to open VideoCallPage
+      // Data payload Flutter can read to open VideoCallPage (main.dart)
       data: {
+        // 👇 this is what your Dart handler checks
         type: 'call',
-        patientName: patientName,
-        channelId: channelId
+
+        // Call context
+        roomId: finalRoomId,
+        channel: finalChannel,
+        token: finalToken,
+        doctorUid: finalDoctorUid,
+        submissionId: finalSubmissionId,
+
+        // Optional patient info
+        patientName: finalPatientName,
+        age: finalAge,
+        sex: finalSex,
+        symptoms: finalSymptoms,
+        address: finalAddress
       }
     };
 
