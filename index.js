@@ -1,4 +1,5 @@
 // index.js
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
@@ -8,7 +9,7 @@ const helmet = require('helmet');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 // =======================
-// 1. FIRE BASE INIT
+// 1. FIREBASE INIT
 // =======================
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('Missing FIREBASE_SERVICE_ACCOUNT env var (JSON).');
@@ -17,9 +18,12 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
+// IMPORTANT: include databaseURL so admin.database() works
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL // set on Render
+  databaseURL:
+    process.env.FIREBASE_DATABASE_URL ||
+    'https://telerhu-default-rtdb.asia-southeast1.firebasedatabase.app'
 });
 
 const db = admin.database();
@@ -51,7 +55,7 @@ const rateLimiter = new RateLimiterMemory({
 // =======================
 async function verifyPassword(candidatePassword, storedHashOrPlain) {
   if (typeof storedHashOrPlain === 'string' && storedHashOrPlain.startsWith('$2')) {
-    // bcrypt hash
+    // hashed with bcrypt
     return bcrypt.compare(candidatePassword, storedHashOrPlain);
   }
   // plain text fallback
@@ -60,8 +64,9 @@ async function verifyPassword(candidatePassword, storedHashOrPlain) {
 
 // =======================
 // 5. IN-MEMORY FCM TOKEN STORE
-//    (For testing; later you can store in RTDB if you like)
 // =======================
+// For now we just keep a set of tokens in memory.
+// Later you can move this to RTDB if you want.
 const tokens = new Set();
 
 // =======================
@@ -73,8 +78,7 @@ app.get('/', (req, res) => {
 
 // =======================
 // 7. REGISTER FCM TOKEN
-//    POST /register
-//    Body: { "token": "FCM_TOKEN_HERE" }
+//    POST /register  { token }
 // =======================
 app.post('/register', (req, res) => {
   const { token } = req.body;
@@ -91,10 +95,20 @@ app.post('/register', (req, res) => {
 });
 
 // =======================
-// 8. SEND INCOMING CALL NOTIF
-//    POST /send-call
-//    Body: { "patientName": "...", "channelId": "..." }
+// 8. SEND-CALL ROUTES
+//    GET  /send-call  -> just to confirm route exists
+//    POST /send-call  -> actually sends FCM
 // =======================
+
+// Quick check route
+app.get('/send-call', (req, res) => {
+  res.json({
+    ok: true,
+    message: 'Use POST /send-call with { patientName, channelId } to send notification'
+  });
+});
+
+// Actual FCM sender
 app.post('/send-call', async (req, res) => {
   try {
     const { patientName, channelId } = req.body;
@@ -120,7 +134,7 @@ app.post('/send-call', async (req, res) => {
     const message = {
       tokens: tokenList,
 
-      // This part makes Android show a notif even if app is terminated
+      // Notification block = shows notif even when app is terminated
       notification: {
         title: 'Incoming TeleRHU Call',
         body: `${patientName} is calling you`
@@ -130,11 +144,11 @@ app.post('/send-call', async (req, res) => {
         priority: 'high',
         notification: {
           sound: 'default',
-          channelId: 'telerhu_calls' // you can create/use this channel on Android later
+          channelId: 'telerhu_calls' // optional custom channel name
         }
       },
 
-      // Data payload for Flutter to read when app opens
+      // Data payload Flutter can read to open VideoCallPage
       data: {
         type: 'call',
         patientName: patientName,
@@ -158,8 +172,7 @@ app.post('/send-call', async (req, res) => {
 
 // =======================
 // 9. LOGIN → CUSTOM TOKEN
-//    POST /login
-//    Body: { username, password, anonymousUid? }
+//    POST /login { username, password, anonymousUid? }
 // =======================
 app.post('/login', async (req, res) => {
   try {
@@ -189,9 +202,7 @@ app.post('/login', async (req, res) => {
     const ok = await verifyPassword(password, userRecord.password);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // Use a stable UID for Firebase Auth
     const firebaseUid = `legacy_${key}`;
-
     const additionalClaims = { legacy: true };
     const token = await admin.auth().createCustomToken(firebaseUid, additionalClaims);
 
@@ -206,4 +217,4 @@ app.post('/login', async (req, res) => {
 // 10. START SERVER
 // =======================
 const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`Auth server listening on port ${port}`));
+app.listen(port, () => console.log(`Auth + FCM server listening on port ${port}`));
