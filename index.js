@@ -1,4 +1,4 @@
-// index.js
+// index.js - FIXED VERSION
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -18,7 +18,6 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-// IMPORTANT: include databaseURL so admin.database() works
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL:
@@ -43,81 +42,112 @@ app.use(
 app.use(bodyParser.json({ limit: '10kb' }));
 
 // =======================
-// 3. RATE LIMITER (for /login)
+// 3. RATE LIMITER
 // =======================
 const rateLimiter = new RateLimiterMemory({
-  points: 5, // 5 attempts
-  duration: 60 * 5 // per 5 minutes
+  points: 5,
+  duration: 60 * 5
 });
 
 // =======================
-// 4. SIMPLE PASSWORD VERIFY
+// 4. PASSWORD VERIFY
 // =======================
 async function verifyPassword(candidatePassword, storedHashOrPlain) {
   if (typeof storedHashOrPlain === 'string' && storedHashOrPlain.startsWith('$2')) {
-    // hashed with bcrypt
     return bcrypt.compare(candidatePassword, storedHashOrPlain);
   }
-  // plain text fallback
   return candidatePassword === storedHashOrPlain;
 }
 
 // =======================
-// 5. IN-MEMORY FCM TOKEN STORE
+// 5. FCM TOKEN STORE - FIXED
 // =======================
-// For now we just keep a set of tokens in memory.
-// Later you can move this to RTDB if you want.
-const tokens = new Set();
+// Store tokens by user: { uid: { token, role, timestamp } }
+const userTokens = new Map();
+
+// Also keep a Set of all tokens for broadcast
+const allTokens = new Set();
 
 // =======================
 // 6. HEALTH CHECK
 // =======================
 app.get('/', (req, res) => {
-  res.json({ ok: true, message: 'Auth + FCM server running' });
+  res.json({ 
+    ok: true, 
+    message: 'Auth + FCM server running',
+    registeredUsers: userTokens.size,
+    totalTokens: allTokens.size
+  });
 });
 
 // =======================
-// 7. REGISTER FCM TOKEN
-//    POST /register  { token }
+// 7. REGISTER FCM TOKEN - FIXED
 // =======================
 app.post('/register', (req, res) => {
-  const { token } = req.body;
+  const { uid, role, token } = req.body;
   console.log('POST /register body:', req.body);
 
   if (!token) {
     return res.status(400).json({ ok: false, error: 'Missing token' });
   }
 
-  tokens.add(token);
-  console.log('Current tokens:', Array.from(tokens));
+  if (!uid) {
+    return res.status(400).json({ ok: false, error: 'Missing uid' });
+  }
 
-  return res.json({ ok: true, token });
+  // Store user info with token
+  userTokens.set(uid, {
+    token,
+    role: role || 'user',
+    timestamp: Date.now()
+  });
+
+  // Add to global token set
+  allTokens.add(token);
+
+  console.log(`✅ Registered token for user ${uid} (${role})`);
+  console.log(`📊 Total users: ${userTokens.size}, Total tokens: ${allTokens.size}`);
+
+  return res.json({ ok: true, uid, token });
 });
 
 // =======================
-// 8. SEND-CALL ROUTES
-//    GET  /send-call  -> just to confirm route exists
-//    POST /send-call  -> actually sends FCM
+// 8. GET REGISTERED TOKENS (DEBUG)
 // =======================
+app.get('/tokens', (req, res) => {
+  const users = Array.from(userTokens.entries()).map(([uid, data]) => ({
+    uid,
+    role: data.role,
+    tokenPreview: data.token.substring(0, 20) + '...',
+    registeredAt: new Date(data.timestamp).toISOString()
+  }));
 
-// Quick check route
-app.get('/send-call', (req, res) => {
   res.json({
     ok: true,
-    message: 'Use POST /send-call with { patientName, channelId } (and optional fields) to send notification'
+    totalUsers: userTokens.size,
+    totalTokens: allTokens.size,
+    users
   });
 });
 
-// Actual FCM sender
+// =======================
+// 9. SEND-CALL - IMPROVED
+// =======================
+app.get('/send-call', (req, res) => {
+  res.json({
+    ok: true,
+    message: 'Use POST /send-call with { patientName, channelId } to send notification',
+    registeredTokens: allTokens.size
+  });
+});
+
 app.post('/send-call', async (req, res) => {
   try {
-    console.log('POST /send-call body:', req.body);
+    console.log('📞 POST /send-call body:', req.body);
 
-    // basic required fields
     const {
       patientName,
-      channelId,      // old name you already used
-      // OPTIONAL (for better integration with main.dart→openVideoCallFromNotification)
+      channelId,
       roomId,
       channel,
       token,
@@ -127,7 +157,9 @@ app.post('/send-call', async (req, res) => {
       age,
       sex,
       symptoms,
-      address
+      address,
+      targetRole,  // optional - send to specific role (e.g., 'doctor')
+      useTopic     // NEW: set to true to use topic instead of tokens
     } = req.body;
 
     if (!patientName || (!channelId && !channel && !roomId)) {
@@ -137,19 +169,41 @@ app.post('/send-call', async (req, res) => {
       });
     }
 
-    const tokenList = Array.from(tokens);
-    if (tokenList.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: 'No tokens registered'
-      });
+    // Determine sending method: topic vs tokens
+    let sendMethod;
+    let tokenList = [];
+    
+    if (useTopic) {
+      // Send to topic (more reliable)
+      sendMethod = 'topic';
+      console.log(`📢 Sending to topic: doctors`);
+    } else {
+      // Send to individual tokens
+      sendMethod = 'tokens';
+      
+      if (targetRole) {
+        // Send to specific role only
+        tokenList = Array.from(userTokens.values())
+          .filter(user => user.role.toLowerCase() === targetRole.toLowerCase())
+          .map(user => user.token);
+        console.log(`🎯 Sending to ${targetRole}s only: ${tokenList.length} tokens`);
+      } else {
+        // Send to all registered tokens
+        tokenList = Array.from(allTokens);
+        console.log(`📢 Broadcasting to all: ${tokenList.length} tokens`);
+      }
+
+      if (tokenList.length === 0) {
+        return res.status(404).json({
+          ok: false,
+          error: targetRole 
+            ? `No ${targetRole} tokens registered` 
+            : 'No tokens registered'
+        });
+      }
     }
 
-    console.log('Sending call notification to tokens:', tokenList);
-
-    // Normalize fields to what Flutter main.dart expects:
-    // openVideoCallFromNotification reads:
-    //   roomId, channel, token, doctorUid, submissionId, patientName, age, sex, symptoms, address
+    // Prepare notification data
     const finalRoomId = (roomId || '').toString();
     const finalChannel = (channel || channelId || '').toString();
     const finalToken = (token || agoraToken || '').toString();
@@ -164,62 +218,126 @@ app.post('/send-call', async (req, res) => {
     const message = {
       tokens: tokenList,
 
-      // Notification block = shows notif even when app is terminated
       notification: {
-        title: 'Incoming TeleRHU Call',
+        title: '📞 Incoming TeleRHU Call',
         body: finalPatientName
           ? `${finalPatientName} is calling you`
           : 'You have an incoming TeleRHU call',
-        // 👇 IMPORTANT for Flutter to route notification taps
-        click_action: 'FLUTTER_NOTIFICATION_CLICK'
+        // CRITICAL for Android notification tap handling
+        clickAction: 'FLUTTER_NOTIFICATION_CLICK'
       },
 
       android: {
         priority: 'high',
         notification: {
           sound: 'default',
-          channelId: 'telerhu_calls' // your custom Android channel (match in native if you configure)
+          channelId: 'telerhu_calls',
+          priority: 'high',
+          defaultSound: true,
+          defaultVibrateTimings: true,
+          // Show as heads-up notification
+          visibility: 'public',
+          // CRITICAL: This makes notification persistent
+          tag: finalChannel || 'telerhu_call',
+          // Add action button
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK'
         }
       },
 
-      // Data payload Flutter can read to open VideoCallPage (main.dart)
-      data: {
-        // 👇 this is what your Dart handler checks
-        type: 'call',
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+            alert: {
+              title: '📞 Incoming TeleRHU Call',
+              body: finalPatientName
+                ? `${finalPatientName} is calling you`
+                : 'You have an incoming TeleRHU call'
+            }
+          }
+        }
+      },
 
-        // Call context
+      data: {
+        type: 'call',
         roomId: finalRoomId,
         channel: finalChannel,
         token: finalToken,
         doctorUid: finalDoctorUid,
         submissionId: finalSubmissionId,
-
-        // Optional patient info
         patientName: finalPatientName,
         age: finalAge,
         sex: finalSex,
         symptoms: finalSymptoms,
-        address: finalAddress
+        address: finalAddress,
+        // Add timestamp for debugging
+        sentAt: Date.now().toString()
       }
     };
 
-    const response = await admin.messaging().sendEachForMulticast(message);
-    console.log('FCM sendEachForMulticast result:', response);
+    // Send notification
+    let response;
+    
+    if (sendMethod === 'topic') {
+      // Send to topic
+      console.log('📤 Sending FCM message to topic: doctors');
+      const topicMessage = { ...message, topic: 'doctors' };
+      delete topicMessage.tokens; // Remove tokens field
+      
+      const messageId = await admin.messaging().send(topicMessage);
+      console.log('✅ Message sent to topic, ID:', messageId);
+      
+      return res.json({
+        ok: true,
+        method: 'topic',
+        messageId,
+        topic: 'doctors'
+      });
+      
+    } else {
+      // Send to individual tokens
+      console.log('📤 Sending FCM message to', tokenList.length, 'device(s)...');
+      response = await admin.messaging().sendEachForMulticast(message);
+      
+      console.log('✅ FCM Response:', {
+        successCount: response.successCount,
+        failureCount: response.failureCount
+      });
 
-    return res.json({
-      ok: true,
-      successCount: response.successCount,
-      failureCount: response.failureCount
-    });
+      // Log any failures with details
+      if (response.failureCount > 0) {
+        response.responses.forEach((resp, idx) => {
+          if (!resp.success) {
+            console.error(`❌ Token ${idx} failed:`, {
+              error: resp.error?.code,
+              message: resp.error?.message,
+              token: tokenList[idx].substring(0, 20) + '...'
+            });
+          }
+        });
+      }
+
+      return res.json({
+        ok: true,
+        method: 'tokens',
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+        tokensSent: tokenList.length
+      });
+    }
   } catch (err) {
-    console.error('Error in /send-call:', err);
-    return res.status(500).json({ ok: false, error: 'Internal error' });
+    console.error('❌ Error in /send-call:', err);
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Internal error',
+      message: err.message 
+    });
   }
 });
 
 // =======================
-// 9. LOGIN → CUSTOM TOKEN
-//    POST /login { username, password, anonymousUid? }
+// 10. LOGIN → CUSTOM TOKEN
 // =======================
 app.post('/login', async (req, res) => {
   try {
@@ -261,7 +379,10 @@ app.post('/login', async (req, res) => {
 });
 
 // =======================
-// 10. START SERVER
+// 11. START SERVER
 // =======================
 const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`Auth + FCM server listening on port ${port}`));
+app.listen(port, () => {
+  console.log(`🚀 Auth + FCM server listening on port ${port}`);
+  console.log(`📱 Ready to receive FCM token registrations`);
+});
