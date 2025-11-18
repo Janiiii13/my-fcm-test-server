@@ -1,148 +1,209 @@
 // index.js
-require('dotenv').config();
 const express = require('express');
-const fs = require('fs').promises;
-const path = require('path');
+const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
+const bcrypt = require('bcryptjs');
+const cors = require('cors');
+const helmet = require('helmet');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
 
-const app = express();
+// =======================
+// 1. FIRE BASE INIT
+// =======================
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  console.error('Missing FIREBASE_SERVICE_ACCOUNT env var (JSON).');
+  process.exit(1);
+}
 
-// parse JSON and URL-encoded bodies
-app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // supports form posts
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-// simple request logger (after parsers so body is available)
-app.use((req, res, next) => {
-  console.log(new Date().toISOString(), req.method, req.url);
-  next();
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DATABASE_URL // set on Render
 });
 
-const TOKENS_FILE = path.join(__dirname, 'tokens.json');
+const db = admin.database();
 
-async function readTokens() {
-  try {
-    const raw = await fs.readFile(TOKENS_FILE, 'utf8');
-    return JSON.parse(raw || '[]');
-  } catch (err) {
-    // if file doesn't exist return empty array
-    if (err.code === 'ENOENT') return [];
-    throw err;
+// =======================
+// 2. EXPRESS + MIDDLEWARE
+// =======================
+const app = express();
+app.use(helmet());
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGINS
+      ? process.env.ALLOWED_ORIGINS.split(',')
+      : true
+  })
+);
+app.use(bodyParser.json({ limit: '10kb' }));
+
+// =======================
+// 3. RATE LIMITER (for /login)
+// =======================
+const rateLimiter = new RateLimiterMemory({
+  points: 5, // 5 attempts
+  duration: 60 * 5 // per 5 minutes
+});
+
+// =======================
+// 4. SIMPLE PASSWORD VERIFY
+// =======================
+async function verifyPassword(candidatePassword, storedHashOrPlain) {
+  if (typeof storedHashOrPlain === 'string' && storedHashOrPlain.startsWith('$2')) {
+    // bcrypt hash
+    return bcrypt.compare(candidatePassword, storedHashOrPlain);
   }
+  // plain text fallback
+  return candidatePassword === storedHashOrPlain;
 }
 
-async function writeTokens(tokens) {
-  await fs.writeFile(TOKENS_FILE, JSON.stringify(tokens, null, 2), 'utf8');
-}
+// =======================
+// 5. IN-MEMORY FCM TOKEN STORE
+//    (For testing; later you can store in RTDB if you like)
+// =======================
+const tokens = new Set();
 
-// root routes
-app.get('/', (req, res) => res.send('Server running'));
-app.post('/', (req, res) => res.send('POST to / received — use /register to send tokens'));
+// =======================
+// 6. HEALTH CHECK
+// =======================
+app.get('/', (req, res) => {
+  res.json({ ok: true, message: 'Auth + FCM server running' });
+});
 
-// register token (stores it to tokens.json) with improved logging & flexible field names
-app.post('/register', async (req, res) => {
-  // debug logging to help identify why token can be undefined
-  console.log('DEBUG req.headers:', req.headers);
-  console.log('DEBUG req.body:', req.body);
-
-  // accept token under several common property names or as query param
-  const token =
-    (req.body && (req.body.token || req.body.fcmToken || req.body.registrationToken || req.body.deviceToken))
-    || req.query.token;
-
-  console.log('📱 Received FCM token:', token);
+// =======================
+// 7. REGISTER FCM TOKEN
+//    POST /register
+//    Body: { "token": "FCM_TOKEN_HERE" }
+// =======================
+app.post('/register', (req, res) => {
+  const { token } = req.body;
+  console.log('POST /register body:', req.body);
 
   if (!token) {
-    return res.status(400).json({
-      ok: false,
-      error: 'missing token in request. expected JSON like { "token": "..." }',
-      hint: 'Ensure Content-Type: application/json and JSON.stringify(body) on the client.',
-      receivedBody: req.body
-    });
+    return res.status(400).json({ ok: false, error: 'Missing token' });
   }
 
+  tokens.add(token);
+  console.log('Current tokens:', Array.from(tokens));
+
+  return res.json({ ok: true, token });
+});
+
+// =======================
+// 8. SEND INCOMING CALL NOTIF
+//    POST /send-call
+//    Body: { "patientName": "...", "channelId": "..." }
+// =======================
+app.post('/send-call', async (req, res) => {
   try {
-    const tokens = await readTokens();
-    if (!tokens.includes(token)) {
-      tokens.push(token);
-      await writeTokens(tokens);
+    const { patientName, channelId } = req.body;
+    console.log('POST /send-call body:', req.body);
+
+    if (!patientName || !channelId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing patientName or channelId'
+      });
     }
-    res.json({ ok: true, token });
+
+    const tokenList = Array.from(tokens);
+    if (tokenList.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: 'No tokens registered'
+      });
+    }
+
+    console.log('Sending call notification to tokens:', tokenList);
+
+    const message = {
+      tokens: tokenList,
+
+      // This part makes Android show a notif even if app is terminated
+      notification: {
+        title: 'Incoming TeleRHU Call',
+        body: `${patientName} is calling you`
+      },
+
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          channelId: 'telerhu_calls' // you can create/use this channel on Android later
+        }
+      },
+
+      // Data payload for Flutter to read when app opens
+      data: {
+        type: 'call',
+        patientName: patientName,
+        channelId: channelId
+      }
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log('FCM sendEachForMulticast result:', response);
+
+    return res.json({
+      ok: true,
+      successCount: response.successCount,
+      failureCount: response.failureCount
+    });
   } catch (err) {
-    console.error('Error saving token:', err);
-    res.status(500).json({ error: 'could not save token' });
+    console.error('Error in /send-call:', err);
+    return res.status(500).json({ ok: false, error: 'Internal error' });
   }
 });
 
-// list tokens (useful for debugging)
-app.get('/tokens', async (req, res) => {
+// =======================
+// 9. LOGIN → CUSTOM TOKEN
+//    POST /login
+//    Body: { username, password, anonymousUid? }
+// =======================
+app.post('/login', async (req, res) => {
   try {
-    const tokens = await readTokens();
-    res.json({ ok: true, count: tokens.length, tokens });
+    await rateLimiter.consume(req.ip);
+  } catch (rlRejected) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  const { username, password, anonymousUid } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Missing username/password' });
+  }
+
+  try {
+    const snap = await db
+      .ref('oldUsers')
+      .orderByChild('username')
+      .equalTo(username)
+      .once('value');
+
+    const val = snap.val();
+    if (!val) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const key = Object.keys(val)[0];
+    const userRecord = val[key];
+
+    const ok = await verifyPassword(password, userRecord.password);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // Use a stable UID for Firebase Auth
+    const firebaseUid = `legacy_${key}`;
+
+    const additionalClaims = { legacy: true };
+    const token = await admin.auth().createCustomToken(firebaseUid, additionalClaims);
+
+    return res.json({ token });
   } catch (err) {
-    console.error('Error reading tokens:', err);
-    res.status(500).json({ error: 'could not read tokens' });
+    console.error('Login error', err);
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// initialise firebase-admin (only if env var exists)
-function initFirebaseAdminIfNeeded() {
-  if (admin.apps.length) return;
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!raw) {
-    console.warn('FIREBASE_SERVICE_ACCOUNT not set; /send will fail until configured.');
-    return;
-  }
-  try {
-    const sa = JSON.parse(raw);
-    admin.initializeApp({ credential: admin.credential.cert(sa) });
-    console.log('Firebase Admin initialized');
-  } catch (err) {
-    console.error('Failed to initialize Firebase Admin:', err);
-  }
-}
-
-// send to a single token
-app.post('/send', async (req, res) => {
-  const { token, title = 'Test', body = 'Hello' } = req.body;
-  if (!token) return res.status(400).json({ error: 'missing token' });
-
-  try {
-    initFirebaseAdminIfNeeded();
-    if (!admin.apps.length) throw new Error('Firebase Admin not initialized');
-
-    const message = { token, notification: { title, body } };
-    const response = await admin.messaging().send(message);
-    console.log('✅ Message sent:', response);
-    res.json({ ok: true, response });
-  } catch (err) {
-    console.error('❌ send error', err);
-    res.status(500).json({ error: err.message || err });
-  }
-});
-
-// send to all stored tokens (careful: avoid spamming)
-app.post('/send-all', async (req, res) => {
-  const { title = 'Broadcast', body = 'Hello everyone' } = req.body;
-  try {
-    initFirebaseAdminIfNeeded();
-    if (!admin.apps.length) throw new Error('Firebase Admin not initialized');
-
-    const tokens = await readTokens();
-    if (!tokens.length) return res.status(400).json({ error: 'no tokens registered' });
-
-    const messages = tokens.map(t => ({ token: t, notification: { title, body } }));
-    // Using Promise.all with send() for simplicity — catch per-send errors so broadcast continues
-    const results = await Promise.all(
-      messages.map(m => admin.messaging().send(m).catch(err => ({ error: err.message || String(err) })))
-    );
-
-    console.log('✅ Broadcast results:', results);
-    res.json({ ok: true, results });
-  } catch (err) {
-    console.error('❌ send-all error', err);
-    res.status(500).json({ error: err.message || err });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// =======================
+// 10. START SERVER
+// =======================
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log(`Auth server listening on port ${port}`));
