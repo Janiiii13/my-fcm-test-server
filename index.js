@@ -65,7 +65,7 @@ async function verifyPassword(candidatePassword, storedHashOrPlain) {
 // Store tokens by user: { uid: { token, role, timestamp } }
 const userTokens = new Map();
 
-// Also keep a Set of all tokens for broadcast
+// Also keep a Set of all tokens for broadcast,jbkh
 const allTokens = new Set();
 
 // =======================
