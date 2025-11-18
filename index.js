@@ -111,7 +111,7 @@ app.post('/register', (req, res) => {
   return res.json({ ok: true, uid, token });
 });
 
-// =======================
+// ======================= 
 // 8. GET REGISTERED TOKENS (DEBUG)
 // =======================
 app.get('/tokens', (req, res) => {
