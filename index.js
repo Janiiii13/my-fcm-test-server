@@ -9,7 +9,7 @@ const helmet = require('helmet');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 // =======================
-// 1. FIREBASE INIT mbvjbjh
+// 1. FIREBASE INIT
 // =======================
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('Missing FIREBASE_SERVICE_ACCOUNT env var (JSON).');
@@ -111,7 +111,7 @@ app.post('/register', (req, res) => {
   return res.json({ ok: true, uid, token });
 });
 
-// ======================= 
+// =======================
 // 8. GET REGISTERED TOKENS (DEBUG)
 // =======================
 app.get('/tokens', (req, res) => {
@@ -216,46 +216,18 @@ app.post('/send-call', async (req, res) => {
     const finalAddress = (address || '').toString();
 
     const message = {
-      tokens: tokenList,
-
       notification: {
-        title: '📞 Incoming TeleRHU Call',
+        title: 'Incoming TeleRHU Call',
         body: finalPatientName
           ? `${finalPatientName} is calling you`
-          : 'You have an incoming TeleRHU call',
-        // CRITICAL for Android notification tap handling
-        clickAction: 'FLUTTER_NOTIFICATION_CLICK'
+          : 'You have an incoming TeleRHU call'
       },
 
       android: {
         priority: 'high',
         notification: {
-          sound: 'default',
           channelId: 'telerhu_calls',
-          priority: 'high',
-          defaultSound: true,
-          defaultVibrateTimings: true,
-          // Show as heads-up notification
-          visibility: 'public',
-          // CRITICAL: This makes notification persistent
-          tag: finalChannel || 'telerhu_call',
-          // Add action button
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK'
-        }
-      },
-
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
-            badge: 1,
-            alert: {
-              title: '📞 Incoming TeleRHU Call',
-              body: finalPatientName
-                ? `${finalPatientName} is calling you`
-                : 'You have an incoming TeleRHU call'
-            }
-          }
+          sound: 'default'
         }
       },
 
@@ -271,10 +243,15 @@ app.post('/send-call', async (req, res) => {
         sex: finalSex,
         symptoms: finalSymptoms,
         address: finalAddress,
-        // Add timestamp for debugging
-        sentAt: Date.now().toString()
+        sentAt: Date.now().toString(),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK'
       }
     };
+    
+    // Add tokens only for multicast
+    if (sendMethod === 'tokens') {
+      message.tokens = tokenList;
+    }
 
     // Send notification
     let response;
