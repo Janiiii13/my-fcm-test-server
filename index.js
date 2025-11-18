@@ -9,7 +9,7 @@ const helmet = require('helmet');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 // =======================
-// 1. FIREBASE INIT
+// 1. FIREBASE INIT mbvjbjh
 // =======================
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('Missing FIREBASE_SERVICE_ACCOUNT env var (JSON).');
