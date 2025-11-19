@@ -142,7 +142,7 @@ app.get('/send-call', (req, res) => {
   res.json({
     ok: true,
     message:
-      'Use POST /send-call with { patientName, channelId } to send notification',
+      'Use POST /send-call with { doctorUid, callerId, callerName, roomId, channel, token } to send notification',
     registeredTokens: allTokens.size
   });
 });
@@ -152,30 +152,45 @@ app.post('/send-call', async (req, res) => {
     console.log('📞 POST /send-call body:', req.body);
 
     const {
+      // old fields (still supported)
       patientName,
       channelId,
       roomId,
       channel,
       token,
       agoraToken,
-      doctorUid,
       submissionId,
       age,
       sex,
       symptoms,
       address,
       targetRole, // optional - send to specific role (e.g., 'doctor')
-      useTopic // optional - set to true to use topic instead of tokens
+      useTopic,   // optional - set to true to use topic instead of tokens
+
+      // NEW: for direct payload from Flutter (caller side)
+      doctorUid,
+      callerId,
+      callerName
     } = req.body;
 
-    if (!patientName || (!channelId && !channel && !roomId)) {
+    // Validate minimal fields (we allow either patientName or callerName / callerId)
+    if (!roomId && !channel && !channelId) {
       return res.status(400).json({
         ok: false,
-        error: 'Missing patientName or channel/channelId/roomId'
+        error: 'Missing channel/channelId/roomId'
       });
     }
 
     const finalDoctorUid = (doctorUid || '').toString();
+    const finalCallerId = (callerId || '').toString();
+    const finalCallerName = (callerName || '').toString();
+
+    // For backwards compatibility: finalPatientName uses patientName → callerName → callerId
+    const finalPatientName =
+      (patientName ||
+        finalCallerName ||
+        finalCallerId ||
+        '').toString();
 
     // Try to get a single doctor's token from in-memory map
     let singleDoctorToken = null;
@@ -235,7 +250,6 @@ app.post('/send-call', async (req, res) => {
     const finalChannel = (channel || channelId || '').toString();
     const finalToken = (token || agoraToken || '').toString();
     const finalSubmissionId = (submissionId || '').toString();
-    const finalPatientName = (patientName || '').toString();
     const finalAge = (age || '').toString();
     const finalSex = (sex || '').toString();
     const finalSymptoms = (symptoms || '').toString();
@@ -243,7 +257,7 @@ app.post('/send-call', async (req, res) => {
 
     const baseMessage = {
       notification: {
-        title: 'Incoming TeleRHU Call',
+        title: 'Incoming TeleRHU Video Call',
         body: finalPatientName
           ? `${finalPatientName} is calling you`
           : 'You have an incoming TeleRHU call'
@@ -252,17 +266,22 @@ app.post('/send-call', async (req, res) => {
       android: {
         priority: 'high',
         notification: {
-          channelId: 'telerhu_calls',
-          sound: 'default'
+          // MUST match the channelId you create in Flutter
+          channelId: 'calls_channel',
+          sound: 'default',
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK'
         }
       },
 
       data: {
-        type: 'call',
+        // for Flutter routing:
+        type: 'video_call',        // <--- important for doctor app handler
         roomId: finalRoomId,
         channel: finalChannel,
         token: finalToken,
         doctorUid: finalDoctorUid,
+        callerId: finalCallerId,
+        callerName: finalCallerName,
         submissionId: finalSubmissionId,
         patientName: finalPatientName,
         age: finalAge,
