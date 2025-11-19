@@ -53,7 +53,10 @@ const rateLimiter = new RateLimiterMemory({
 // 4. PASSWORD VERIFY
 // =======================
 async function verifyPassword(candidatePassword, storedHashOrPlain) {
-  if (typeof storedHashOrPlain === 'string' && storedHashOrPlain.startsWith('$2')) {
+  if (
+    typeof storedHashOrPlain === 'string' &&
+    storedHashOrPlain.startsWith('$2')
+  ) {
     return bcrypt.compare(candidatePassword, storedHashOrPlain);
   }
   return candidatePassword === storedHashOrPlain;
@@ -72,8 +75,8 @@ const allTokens = new Set();
 // 6. HEALTH CHECK
 // =======================
 app.get('/', (req, res) => {
-  res.json({ 
-    ok: true, 
+  res.json({
+    ok: true,
     message: 'Auth + FCM server running',
     registeredUsers: userTokens.size,
     totalTokens: allTokens.size
@@ -106,7 +109,9 @@ app.post('/register', (req, res) => {
   allTokens.add(token);
 
   console.log(`✅ Registered token for user ${uid} (${role})`);
-  console.log(`📊 Total users: ${userTokens.size}, Total tokens: ${allTokens.size}`);
+  console.log(
+    `📊 Total users: ${userTokens.size}, Total tokens: ${allTokens.size}`
+  );
 
   return res.json({ ok: true, uid, token });
 });
@@ -136,7 +141,8 @@ app.get('/tokens', (req, res) => {
 app.get('/send-call', (req, res) => {
   res.json({
     ok: true,
-    message: 'Use POST /send-call with { patientName, channelId } to send notification',
+    message:
+      'Use POST /send-call with { patientName, channelId } to send notification',
     registeredTokens: allTokens.size
   });
 });
@@ -158,8 +164,8 @@ app.post('/send-call', async (req, res) => {
       sex,
       symptoms,
       address,
-      targetRole,  // optional - send to specific role (e.g., 'doctor')
-      useTopic     // optional - set to true to use topic instead of tokens
+      targetRole, // optional - send to specific role (e.g., 'doctor')
+      useTopic // optional - set to true to use topic instead of tokens
     } = req.body;
 
     if (!patientName || (!channelId && !channel && !roomId)) {
@@ -169,45 +175,65 @@ app.post('/send-call', async (req, res) => {
       });
     }
 
-    // Determine sending method: topic vs tokens
+    const finalDoctorUid = (doctorUid || '').toString();
+
+    // Try to get a single doctor's token from in-memory map
+    let singleDoctorToken = null;
+    if (finalDoctorUid && userTokens.has(finalDoctorUid)) {
+      singleDoctorToken = userTokens.get(finalDoctorUid).token;
+      console.log(`🎯 Will send call to doctorUid=${finalDoctorUid}`);
+    } else if (finalDoctorUid) {
+      console.warn(
+        `⚠️ doctorUid=${finalDoctorUid} has no registered token in userTokens`
+      );
+    }
+
+    // Determine sending method
     let sendMethod;
     let tokenList = [];
-    
-    if (useTopic) {
-      // Send to topic (more reliable)
+
+    if (singleDoctorToken) {
+      // ✅ Best case: we know exactly which doctor to notify
+      sendMethod = 'single';
+      console.log('🎯 Sending call to single doctor token');
+    } else if (useTopic) {
+      // Fallback: topic broadcast (all doctors)
       sendMethod = 'topic';
-      console.log(`📢 Sending to topic: doctors`);
+      console.log('📢 Sending to topic: doctors');
     } else {
-      // Send to individual tokens
+      // Fallback: tokens (all or by role)
       sendMethod = 'tokens';
-      
+
       if (targetRole) {
-        // Send to specific role only
         tokenList = Array.from(userTokens.values())
-          .filter(user => user.role.toLowerCase() === targetRole.toLowerCase())
-          .map(user => user.token);
-        console.log(`🎯 Sending to ${targetRole}s only: ${tokenList.length} tokens`);
+          .filter(
+            (u) => (u.role || '').toLowerCase() === targetRole.toLowerCase()
+          )
+          .map((u) => u.token);
+        console.log(
+          `🎯 Sending to ${targetRole}s only: ${tokenList.length} tokens`
+        );
       } else {
-        // Send to all registered tokens
         tokenList = Array.from(allTokens);
-        console.log(`📢 Broadcasting to all: ${tokenList.length} tokens`);
+        console.log(
+          `📢 Broadcasting to all: ${tokenList.length} tokens`
+        );
       }
 
       if (tokenList.length === 0) {
         return res.status(404).json({
           ok: false,
-          error: targetRole 
-            ? `No ${targetRole} tokens registered` 
+          error: targetRole
+            ? `No ${targetRole} tokens registered`
             : 'No tokens registered'
         });
       }
     }
 
-    // Prepare notification data
+    // Prepare notification data (base message)
     const finalRoomId = (roomId || '').toString();
     const finalChannel = (channel || channelId || '').toString();
     const finalToken = (token || agoraToken || '').toString();
-    const finalDoctorUid = (doctorUid || '').toString();
     const finalSubmissionId = (submissionId || '').toString();
     const finalPatientName = (patientName || '').toString();
     const finalAge = (age || '').toString();
@@ -215,7 +241,7 @@ app.post('/send-call', async (req, res) => {
     const finalSymptoms = (symptoms || '').toString();
     const finalAddress = (address || '').toString();
 
-    const message = {
+    const baseMessage = {
       notification: {
         title: 'Incoming TeleRHU Call',
         body: finalPatientName
@@ -247,68 +273,89 @@ app.post('/send-call', async (req, res) => {
         click_action: 'FLUTTER_NOTIFICATION_CLICK'
       }
     };
-    
-    // Add tokens only for multicast
-    if (sendMethod === 'tokens') {
-      message.tokens = tokenList;
+
+    // ========== SEND NOTIFICATION ==========
+    if (sendMethod === 'single') {
+      // ✅ Single doctor: admin.messaging().send(...)
+      const singleMessage = {
+        ...baseMessage,
+        token: singleDoctorToken
+      };
+
+      console.log('📤 Sending FCM message to single doctor...');
+      const messageId = await admin.messaging().send(singleMessage);
+      console.log('✅ FCM single send ID:', messageId);
+
+      return res.json({
+        ok: true,
+        method: 'single',
+        doctorUid: finalDoctorUid,
+        messageId
+      });
     }
 
-    // Send notification
-    let response;
-    
     if (sendMethod === 'topic') {
-      // Send to topic
       console.log('📤 Sending FCM message to topic: doctors');
-      const topicMessage = { ...message, topic: 'doctors' };
-      delete topicMessage.tokens; // Remove tokens field
-      
+      const topicMessage = {
+        ...baseMessage,
+        topic: 'doctors'
+      };
       const messageId = await admin.messaging().send(topicMessage);
       console.log('✅ Message sent to topic, ID:', messageId);
-      
+
       return res.json({
         ok: true,
         method: 'topic',
         messageId,
         topic: 'doctors'
       });
-      
-    } else {
-      // Send to individual tokens
-      console.log('📤 Sending FCM message to', tokenList.length, 'device(s)...');
-      response = await admin.messaging().sendEachForMulticast(message);
-      
-      console.log('✅ FCM Response:', {
-        successCount: response.successCount,
-        failureCount: response.failureCount
-      });
+    }
 
-      // Log any failures with details
-      if (response.failureCount > 0) {
-        response.responses.forEach((resp, idx) => {
-          if (!resp.success) {
-            console.error(`❌ Token ${idx} failed:`, {
-              error: resp.error?.code,
-              message: resp.error?.message,
-              token: tokenList[idx].substring(0, 20) + '...'
-            });
-          }
-        });
-      }
+    // sendMethod === 'tokens' (multicast)
+    const multicastMessage = {
+      ...baseMessage,
+      tokens: tokenList
+    };
 
-      return res.json({
-        ok: true,
-        method: 'tokens',
-        successCount: response.successCount,
-        failureCount: response.failureCount,
-        tokensSent: tokenList.length
+    console.log(
+      '📤 Sending FCM message to',
+      tokenList.length,
+      'device(s)...'
+    );
+    const response = await admin.messaging().sendEachForMulticast(
+      multicastMessage
+    );
+
+    console.log('✅ FCM Response:', {
+      successCount: response.successCount,
+      failureCount: response.failureCount
+    });
+
+    if (response.failureCount > 0) {
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          console.error(`❌ Token ${idx} failed:`, {
+            error: resp.error?.code,
+            message: resp.error?.message,
+            token: tokenList[idx].substring(0, 20) + '...'
+          });
+        }
       });
     }
+
+    return res.json({
+      ok: true,
+      method: 'tokens',
+      successCount: response.successCount,
+      failureCount: response.failureCount,
+      tokensSent: tokenList.length
+    });
   } catch (err) {
     console.error('❌ Error in /send-call:', err);
-    return res.status(500).json({ 
-      ok: false, 
+    return res.status(500).json({
+      ok: false,
       error: 'Internal error',
-      message: err.message 
+      message: err.message
     });
   }
 });
@@ -346,7 +393,9 @@ app.post('/login', async (req, res) => {
 
     const firebaseUid = `legacy_${key}`;
     const additionalClaims = { legacy: true };
-    const token = await admin.auth().createCustomToken(firebaseUid, additionalClaims);
+    const token = await admin
+      .auth()
+      .createCustomToken(firebaseUid, additionalClaims);
 
     return res.json({ token });
   } catch (err) {
